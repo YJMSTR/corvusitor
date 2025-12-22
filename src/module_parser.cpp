@@ -4,6 +4,12 @@
 #include <iostream>
 #include <algorithm>
 #include <cctype>
+#include <sys/stat.h>
+
+static bool file_exists(const std::string& path) {
+  struct stat st;
+  return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
 
 // ============================================================================
 // ModuleParser Base Class - Common utility functions
@@ -254,12 +260,125 @@ ModuleInfo ModelsimModuleParser::parse(const std::string& header_path) {
 }
 
 // ============================================================================
+// GsimModuleParser Implementation
+// ============================================================================
+
+ModuleType GsimModuleParser::parse_module_type_str(const std::string& s) {
+  if (s == "COMB") return ModuleType::COMB;
+  if (s == "SEQ") return ModuleType::SEQ;
+  if (s == "EXTERNAL") return ModuleType::EXTERNAL;
+  throw std::runtime_error("Unknown GSIM module type: " + s);
+}
+
+ModuleInfo GsimModuleParser::parse(const std::string& header_path) {
+  ModuleInfo info;
+  info.header_path = header_path;
+
+  // Locate module directory and module.json
+  size_t last_slash = header_path.find_last_of('/');
+  std::string dir = (last_slash == std::string::npos) ? "./" : header_path.substr(0, last_slash);
+  std::string json_path = dir + "/module.json";
+
+  std::ifstream jf(json_path);
+  if (!jf.is_open()) {
+    throw std::runtime_error("Failed to open GSIM module.json: " + json_path);
+  }
+
+  std::stringstream buffer;
+  buffer << jf.rdbuf();
+  std::string json = buffer.str();
+
+  // Minimal regex-based parsing (module.json is a small, regular format in this project).
+  auto extract_str = [&](const std::string& key) -> std::string {
+    std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]+)\"");
+    std::smatch m;
+    if (!std::regex_search(json, m, re)) {
+      throw std::runtime_error("Missing key in module.json: " + key);
+    }
+    return m[1].str();
+  };
+  auto extract_int = [&](const std::string& key) -> int {
+    std::regex re("\"" + key + "\"\\s*:\\s*(-?\\d+)");
+    std::smatch m;
+    if (!std::regex_search(json, m, re)) {
+      throw std::runtime_error("Missing key in module.json: " + key);
+    }
+    return std::stoi(m[1].str());
+  };
+
+  info.module_name = extract_str("module_name");
+  info.class_name = extract_str("class_name");
+  info.type = parse_module_type_str(extract_str("type"));
+  info.partition_id = extract_int("partition_id");
+
+  // Instance name: follow existing convention (lowercase, strip corvus_ when present).
+  info.instance_name = generate_instance_name(info.class_name, info.type);
+
+  // Header path selection: try class_name.h then module_name.h, then fallback to the provided header_path.
+  std::string candidate1 = dir + "/" + info.class_name + ".h";
+  std::string candidate2 = dir + "/" + info.module_name + ".h";
+  if (file_exists(candidate1)) info.header_path = candidate1;
+  else if (file_exists(candidate2)) info.header_path = candidate2;
+  else info.header_path = header_path;
+
+  // Library path selection: try lib<class_name>.a then libS<module_name>.a then lib<module_name>.a
+  std::string lib1 = dir + "/lib" + info.class_name + ".a";
+  std::string lib2 = dir + "/libS" + info.module_name + ".a";
+  std::string lib3 = dir + "/lib" + info.module_name + ".a";
+  if (file_exists(lib1)) info.lib_path = lib1;
+  else if (file_exists(lib2)) info.lib_path = lib2;
+  else if (file_exists(lib3)) info.lib_path = lib3;
+  else info.lib_path = lib1; // default expected name
+
+  // Parse ports: {"name": "...", "direction": "input|output", "width": N, ...}
+  // Note: keep it simple; we only need name/direction/width for the integration plan.
+  std::regex port_re("\\{[^\\}]*\"name\"\\s*:\\s*\"([^\"]+)\"[^\\}]*\"direction\"\\s*:\\s*\"(input|output)\"[^\\}]*\"width\"\\s*:\\s*(\\d+)[^\\}]*\\}");
+  auto begin = std::sregex_iterator(json.begin(), json.end(), port_re);
+  auto end = std::sregex_iterator();
+  for (auto it = begin; it != end; ++it) {
+    std::smatch m = *it;
+    PortInfo p;
+    p.name = m[1].str();
+    std::string dir_str = m[2].str();
+    int width = std::stoi(m[3].str());
+    if (width <= 0) width = 1;  // be defensive: treat unknown/0-width as 1-bit
+
+    p.direction = (dir_str == "input") ? PortDirection::INPUT : PortDirection::OUTPUT;
+    p.lsb = 0;
+    p.msb = width > 0 ? (width - 1) : 0;
+    p.array_size = 0;
+
+    if (width <= 8) p.width_type = PortWidthType::VL_8;
+    else if (width <= 16) p.width_type = PortWidthType::VL_16;
+    else if (width <= 32) p.width_type = PortWidthType::VL_32;
+    else if (width <= 64) p.width_type = PortWidthType::VL_64;
+    else {
+      // Placeholder mapping for wide ports; real GSIM uses _BitInt, Verilator uses VlWide.
+      // Keep something non-crashing for downstream code that expects a width_type.
+      p.width_type = PortWidthType::VL_W;
+      p.array_size = (width + 31) / 32;
+    }
+
+    info.ports.push_back(p);
+  }
+
+  if (info.ports.empty()) {
+    throw std::runtime_error("No ports parsed from GSIM module.json: " + json_path);
+  }
+
+  std::cout << "Parsed " << info.ports.size() << " ports from GSIM module.json (" << info.module_name << ")\n";
+  return info;
+}
+
+// ============================================================================
 // ModuleParserFactory Implementation
 // ============================================================================
 
 std::unique_ptr<ModuleParser> ModuleParserFactory::create(const std::string& simulator_name) {
   if (simulator_name == "Verilator") {
     return std::unique_ptr<ModuleParser>(new VerilatorModuleParser());
+  } else if (simulator_name == "GSIM") {
+    return std::unique_ptr<ModuleParser>(new GsimModuleParser());
   } else if (simulator_name == "VCS") {
     return std::unique_ptr<ModuleParser>(new VCSModuleParser());
   } else if (simulator_name == "Modelsim") {

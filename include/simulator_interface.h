@@ -155,6 +155,39 @@ private:
 };
 
 /**
+ * GsimSimulator - GSIM-specific implementation
+ *
+ * Discovers modules in "gsim-compile-<module_name>" directories and locates
+ * headers/lib based on the module name and/or module.json metadata.
+ *
+ * Note: GSIM header filename may be either "<module_name>.h" (current emitter)
+ * or "<class_name>.h" (legacy/alternate). Corvusitor will prefer module.json
+ * when parsing, but discovery still needs a plausible header path.
+ */
+class GsimSimulator : public SimulatorInterface {
+public:
+  GsimSimulator() = default;
+  virtual ~GsimSimulator() = default;
+
+  std::vector<std::string> discover_modules(const std::string& base_dir) override;
+
+  bool match_module_directory(const std::string& base_dir,
+                               const std::string& entry_name,
+                               std::string& out_module_name) override;
+
+  std::string get_header_path(const std::string& base_dir,
+                               const std::string& module_name) override;
+
+  std::string get_simulator_name() const override {
+    return "GSIM";
+  }
+
+private:
+  // Directory pattern: "gsim-compile-<module_name>"
+  static constexpr const char* DIR_PREFIX = "gsim-compile-";
+};
+
+/**
  * SimulatorFactory - Factory to create simulator interfaces
  */
 class SimulatorFactory {
@@ -162,7 +195,8 @@ public:
   enum class SimulatorType {
     VERILATOR,
     VCS,      // For future support
-    MODELSIM  // For future support
+    MODELSIM, // For future support
+    GSIM
   };
 
   /**

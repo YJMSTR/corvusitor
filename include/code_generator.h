@@ -49,6 +49,25 @@ public:
   bool generate_all(const std::string& output_file_base);
 
   /**
+   * Generate a single-module GSIM-vs-Verilator diff runner.
+   *
+   * This is an incremental integration step: corvusitor discovers one module
+   * that exists in both simulator outputs under modules_dir_, then generates
+   * a standalone C++ program + Makefile that builds and runs randomized
+   * differential testing for ports with width <= 64.
+   *
+   * @param module_name Target module name (e.g. corvus_comb_P0)
+   * @param output_file_base Output base name without extension
+   * @param iters Number of random vectors
+   * @param seed RNG seed
+   */
+  bool generate_single_module_diff(const std::string& module_name,
+                                   const std::string& output_file_base,
+                                   int iters,
+                                   unsigned long long seed,
+                                   int max_width_bits);
+
+  /**
    * Generate Makefile
    * @param output_file_base Makefile base name without extension
    * @return Returns true on success

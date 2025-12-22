@@ -184,6 +184,64 @@ std::string ModelsimSimulator::get_header_path(const std::string& base_dir,
 }
 
 // ============================================================================
+// GsimSimulator Implementation
+// ============================================================================
+
+bool GsimSimulator::match_module_directory(const std::string& base_dir,
+                                           const std::string& entry_name,
+                                           std::string& out_module_name) {
+  // Pattern: "gsim-compile-<module_name>"
+  std::string pattern_str = std::string(DIR_PREFIX) + "(.+)";
+  std::regex dir_pattern(pattern_str);
+  std::smatch match;
+
+  if (std::regex_match(entry_name, match, dir_pattern)) {
+    // Check if it's a directory
+    std::string full_path = base_dir + "/" + entry_name;
+    struct stat st;
+    if (stat(full_path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+      out_module_name = match[1].str();
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<std::string> GsimSimulator::discover_modules(const std::string& base_dir) {
+  std::vector<std::string> module_names;
+
+  DIR* dir = opendir(base_dir.c_str());
+  if (!dir) {
+    std::cerr << "Failed to open directory: " << base_dir << std::endl;
+    return module_names;
+  }
+
+  std::cout << "  [" << get_simulator_name() << "] Scanning directory: " << base_dir << std::endl;
+
+  struct dirent* entry;
+  while ((entry = readdir(dir)) != nullptr) {
+    std::string module_name;
+    if (match_module_directory(base_dir, entry->d_name, module_name)) {
+      module_names.push_back(module_name);
+      std::cout << "    Found module: " << module_name << std::endl;
+    }
+  }
+  closedir(dir);
+
+  // Sort for consistent ordering
+  std::sort(module_names.begin(), module_names.end());
+  std::cout << "  Total modules discovered: " << module_names.size() << std::endl;
+
+  return module_names;
+}
+
+std::string GsimSimulator::get_header_path(const std::string& base_dir,
+                                           const std::string& module_name) {
+  // Common GSIM header naming: "<module_name>.h"
+  return base_dir + "/" + DIR_PREFIX + module_name + "/" + module_name + ".h";
+}
+
+// ============================================================================
 // SimulatorFactory Implementation
 // ============================================================================
 
@@ -197,6 +255,9 @@ std::unique_ptr<SimulatorInterface> SimulatorFactory::create(SimulatorType type)
     
     case SimulatorType::MODELSIM:
       return std::unique_ptr<SimulatorInterface>(new ModelsimSimulator());
+
+    case SimulatorType::GSIM:
+      return std::unique_ptr<SimulatorInterface>(new GsimSimulator());
     
     default:
       std::cerr << "Unknown simulator type" << std::endl;
@@ -214,6 +275,7 @@ SimulatorFactory::SimulatorType SimulatorFactory::auto_detect(const std::string&
   bool has_verilator = false;
   bool has_vcs = false;
   bool has_modelsim = false;
+  bool has_gsim = false;
 
   struct dirent* entry;
   while ((entry = readdir(dir)) != nullptr) {
@@ -233,13 +295,21 @@ SimulatorFactory::SimulatorType SimulatorFactory::auto_detect(const std::string&
     if (entry_name.find("modelsim-compile-") == 0) {
       has_modelsim = true;
     }
+
+    // Check for GSIM pattern
+    if (entry_name.find("gsim-compile-") == 0) {
+      has_gsim = true;
+    }
   }
   closedir(dir);
 
-  // Priority: Verilator > VCS > Modelsim
+  // Priority: Verilator > GSIM > VCS > Modelsim
   if (has_verilator) {
     std::cout << "Auto-detected simulator: Verilator" << std::endl;
     return SimulatorType::VERILATOR;
+  } else if (has_gsim) {
+    std::cout << "Auto-detected simulator: GSIM" << std::endl;
+    return SimulatorType::GSIM;
   } else if (has_vcs) {
     std::cout << "Auto-detected simulator: VCS" << std::endl;
     return SimulatorType::VCS;
@@ -258,6 +328,9 @@ std::vector<std::unique_ptr<SimulatorInterface>> SimulatorFactory::create_all() 
   
   // Add Verilator
   simulators.push_back(std::unique_ptr<SimulatorInterface>(new VerilatorSimulator()));
+
+  // Add GSIM
+  simulators.push_back(std::unique_ptr<SimulatorInterface>(new GsimSimulator()));
   
   // Add VCS (with placeholder implementation)
   simulators.push_back(std::unique_ptr<SimulatorInterface>(new VCSSimulator()));
