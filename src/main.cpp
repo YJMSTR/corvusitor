@@ -25,6 +25,7 @@ int main(int argc, char* argv[]) {
     ("m,modules-dir", "Path to the modules directory", cxxopts::value<std::string>()->default_value("."))
     ("o,output-name", "Output C++ implementation file name", cxxopts::value<std::string>()->default_value("VCorvusTopWrapper_generated.cpp"))
     ("mode", "Mode: wrapper|diff-single", cxxopts::value<std::string>()->default_value("wrapper"))
+    ("backend-policy", "Backend policy when both GSIM and Verilator outputs exist: mixed|verilator|gsim (default mixed)", cxxopts::value<std::string>()->default_value("mixed"))
     ("diff-module", "Module name for diff-single mode (e.g. corvus_comb_P0)", cxxopts::value<std::string>()->default_value(""))
     ("diff-iters", "Number of random vectors for diff-single mode", cxxopts::value<int>()->default_value("10000"))
     ("diff-seed", "RNG seed for diff-single mode", cxxopts::value<unsigned long long>()->default_value("12648430"))  // 0xC0FFEE
@@ -53,6 +54,19 @@ int main(int argc, char* argv[]) {
 
   // Create code generator
   CodeGenerator generator(modules_dir);
+  {
+    std::string policy = result["backend-policy"].as<std::string>();
+    if (policy == "mixed") {
+      generator.set_backend_policy(CodeGenerator::BackendPolicy::MIXED);
+    } else if (policy == "verilator") {
+      generator.set_backend_policy(CodeGenerator::BackendPolicy::VERILATOR_ONLY);
+    } else if (policy == "gsim") {
+      generator.set_backend_policy(CodeGenerator::BackendPolicy::GSIM_ONLY);
+    } else {
+      std::cerr << "Error: unknown --backend-policy=" << policy << " (expected mixed|verilator|gsim)\n";
+      return 1;
+    }
+  }
 
   std::string output_cpp = result["output-name"].as<std::string>();
   std::string output_base = output_cpp.substr(0, output_cpp.rfind(".cpp"));

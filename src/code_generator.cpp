@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <cstdlib>
+#include <limits.h>
 
 CodeGenerator::CodeGenerator(const std::string& modules_dir)
   :modules_dir_(modules_dir)
@@ -17,6 +18,19 @@ CodeGenerator::CodeGenerator(const std::string& modules_dir)
   ,total_connections_(0)
   ,vlwide_ports_(0)
   ,top_outputs_(0) {
+}
+
+CodeGenerator::CodeGenerator(const std::string& modules_dir,
+                             SimulatorFactory::SimulatorType simulator_type)
+  : CodeGenerator(modules_dir) {
+  // Interpret this legacy constructor as "force a single backend".
+  if (simulator_type == SimulatorFactory::SimulatorType::VERILATOR) {
+    backend_policy_ = BackendPolicy::VERILATOR_ONLY;
+  } else if (simulator_type == SimulatorFactory::SimulatorType::GSIM) {
+    backend_policy_ = BackendPolicy::GSIM_ONLY;
+  } else {
+    backend_policy_ = BackendPolicy::MIXED;
+  }
 }
 
 static std::string path_dirname(const std::string& p) {
@@ -35,6 +49,66 @@ static bool file_exists(const std::string& path) {
   return stat(path.c_str(), &st) == 0;
 }
 
+static std::string to_abs_path(const std::string& p) {
+  char buf[PATH_MAX];
+  if (realpath(p.c_str(), buf)) return std::string(buf);
+  return p;
+}
+
+static const PortInfo* find_port_by_logical_name(const ModuleInfo* m, const std::string& logical_name) {
+  if (!m) return nullptr;
+  for (const auto& p : m->ports) {
+    if (p.name == logical_name) return &p;
+  }
+  return nullptr;
+}
+
+static int words_for_width(int w) {
+  return (w + 31) / 32;
+}
+
+// Emit a large propagate function as multiple smaller helper functions to avoid
+// extremely large single functions that can stress compilers (and slow builds).
+std::string CodeGenerator::generate_chunked_propagate(const std::vector<PortConnection>& connections,
+                                                      const std::string& function_name,
+                                                      const std::string& comment,
+                                                      size_t chunk_size) {
+  std::ostringstream oss;
+  const size_t n = connections.size();
+  const size_t chunks = chunk_size == 0 ? 1 : (n + chunk_size - 1) / chunk_size;
+
+  oss << "void VCorvusTopWrapper::" << function_name << "() {\n";
+  oss << "    // " << comment << "\n";
+  oss << "    // Auto-generated: " << n << " connections\n";
+  if (n == 0) {
+    oss << "    // No connections\n";
+  } else if (chunks == 1) {
+    for (const auto& c : connections) {
+      oss << generate_assignment(c);
+    }
+  } else {
+    for (size_t i = 0; i < chunks; ++i) {
+      oss << "    " << function_name << "_chunk" << i << "();\n";
+    }
+  }
+  oss << "}\n\n";
+
+  if (n == 0 || chunks <= 1) return oss.str();
+
+  for (size_t i = 0; i < chunks; ++i) {
+    const size_t begin = i * chunk_size;
+    const size_t end = std::min(n, begin + chunk_size);
+    oss << "void VCorvusTopWrapper::" << function_name << "_chunk" << i << "() {\n";
+    oss << "    // chunk " << i << " [" << begin << ", " << end << ")\n";
+    for (size_t j = begin; j < end; ++j) {
+      oss << generate_assignment(connections[j]);
+    }
+    oss << "}\n\n";
+  }
+
+  return oss.str();
+}
+
 bool CodeGenerator::load_data() {
   std::cout << "\n=== Loading Module Data ===" << std::endl;
 
@@ -50,13 +124,12 @@ bool CodeGenerator::load_data() {
     return false;
   }
 
-  // Parse each module header using appropriate parser for each simulator
-  std::vector<ModuleInfo> modules_list;
-  
+  // Parse each discovered module candidate using the appropriate parser.
+  // Then select one backend per logical module name (e.g. prefer GSIM for COMB, Verilator for SEQ).
+  std::map<std::string, std::vector<ModuleInfo>> candidates;
   for (const auto& result : discovery_results) {
     std::cout << "  Parsing " << result.header_path << " [" << result.simulator_name << "]..." << std::endl;
     
-    // Create appropriate parser for this simulator
     std::unique_ptr<ModuleParser> parser = ModuleParserFactory::create(result.simulator_name);
     if (!parser) {
       std::cerr << "Failed to create parser for simulator: " << result.simulator_name << std::endl;
@@ -64,17 +137,78 @@ bool CodeGenerator::load_data() {
     }
     
     ModuleInfo info = parser->parse(result.header_path);
+    if (info.simulator_name.empty()) info.simulator_name = result.simulator_name;
 
     if (info.ports.empty()) {
       std::cerr << "Failed to parse module: " << result.module_name << std::endl;
       return false;
     }
 
-    modules_[result.module_name] = info;
-    modules_list.push_back(info);
-
+    candidates[info.module_name].push_back(info);
     std::cout << "    -> " << info.ports.size() << " ports" << std::endl;
   }
+
+  auto score_candidate = [&](const ModuleInfo& m) -> int {
+    // Policy is configurable:
+    // - MIXED (default): COMB prefers GSIM; SEQ/EXTERNAL prefer Verilator.
+    // - VERILATOR_ONLY: always prefer Verilator when available.
+    // - GSIM_ONLY: always prefer GSIM when available.
+    switch (backend_policy_) {
+      case BackendPolicy::VERILATOR_ONLY:
+        if (m.is_verilator()) return 100;
+        if (m.is_gsim()) return 50;
+        return 0;
+      case BackendPolicy::GSIM_ONLY:
+        if (m.is_gsim()) return 100;
+        if (m.is_verilator()) return 50;
+        return 0;
+      case BackendPolicy::MIXED:
+      default:
+        break;
+    }
+
+    const bool prefer_gsim = (m.type == ModuleType::COMB);
+    if (prefer_gsim) {
+      if (m.is_gsim()) return 100;
+      if (m.is_verilator()) return 50;
+    } else {
+      if (m.is_verilator()) return 100;
+      if (m.is_gsim()) return 50;
+    }
+    return 0;
+  };
+
+  modules_.clear();
+  std::vector<ModuleInfo> modules_list;
+  for (auto& kv : candidates) {
+    const std::string& mod_name = kv.first;
+    std::vector<ModuleInfo>& vec = kv.second;
+    if (vec.empty()) continue;
+
+    // Pick best-scoring candidate.
+    size_t best_i = 0;
+    int best_s = score_candidate(vec[0]);
+    for (size_t i = 1; i < vec.size(); ++i) {
+      int s = score_candidate(vec[i]);
+      if (s > best_s) {
+        best_s = s;
+        best_i = i;
+      }
+    }
+
+    if (vec.size() > 1) {
+      std::cout << "  [select] module=" << mod_name << " candidates=" << vec.size()
+                << " chosen=" << vec[best_i].simulator_name
+                << " type=" << vec[best_i].get_type_str() << "\n";
+    }
+
+    modules_[mod_name] = vec[best_i];
+    modules_list.push_back(vec[best_i]);
+  }
+
+  // Sort for consistent ordering (helps deterministic output).
+  std::sort(modules_list.begin(), modules_list.end(),
+            [](const ModuleInfo& a, const ModuleInfo& b) { return a.module_name < b.module_name; });
 
   // Build connections
   std::cout << "\n=== Building Connections ===" << std::endl;
@@ -197,10 +331,11 @@ bool CodeGenerator::generate_single_module_diff(const std::string& module_name,
   std::map<std::string, VPortMeta> vports;
   for (const auto& p : vinfo.ports) {
     const int w = p.get_width();
-    vports[p.name] = {p.name, w};
-    const std::string c = canon(p.name);
-    if (c != p.name && vports.find(c) == vports.end()) {
-      vports[c] = {p.name, w};
+    const std::string field = p.get_cpp_name();
+    vports[p.name] = {field, w};
+    const std::string c = canon(field);
+    if (vports.find(c) == vports.end()) {
+      vports[c] = {field, w};
     }
   }
 
@@ -212,15 +347,16 @@ bool CodeGenerator::generate_single_module_diff(const std::string& module_name,
   for (const auto& p : ginfo.ports) {
     if (p.direction != PortDirection::INPUT) continue;
     int w = p.get_width();
-    const std::string key = canon(p.name);
+    const std::string key = p.name;
     auto vit = vports.find(key);
     if (vit == vports.end()) continue;
     const std::string vname = vit->second.field_name;
+    const std::string gname = p.get_cpp_name();
 
     // Keep clock/reset deterministic.
     if (p.name == "clock" || p.name == "clk" || p.name == "reset" || p.name == "rst") {
       ocpp << "    v." << vname << " = 0;\n";
-      ocpp << "    g.set_" << p.name << "(0);\n";
+      ocpp << "    g.set_" << gname << "(0);\n";
       continue;
     }
 
@@ -234,7 +370,7 @@ bool CodeGenerator::generate_single_module_diff(const std::string& module_name,
       ocpp << "      const uint64_t m = mask_u64(" << w << ");\n";
       ocpp << "      const uint64_t raw = rng() & m;\n";
       ocpp << "      v." << vname << " = raw;\n";
-      ocpp << "      g.set_" << p.name << "(raw);\n";
+      ocpp << "      g.set_" << gname << "(raw);\n";
       ocpp << "    }\n";
       continue;
     }
@@ -256,7 +392,7 @@ bool CodeGenerator::generate_single_module_diff(const std::string& module_name,
       // Should be rare/unexpected, but keep generation robust if metadata is inconsistent.
       ocpp << "      v." << vname << " = 0;\n";
     }
-    ocpp << "      using T = decltype(g." << p.name << ");\n";
+    ocpp << "      using T = unsigned _BitInt(" << w << ");\n";
     ocpp << "      T gv = 0;\n";
     ocpp << "      for (int wi = 0; wi < " << drive_words << "; ++wi) {\n";
     ocpp << "        uint32_t w32 = static_cast<uint32_t>(rng());\n";
@@ -266,7 +402,7 @@ bool CodeGenerator::generate_single_module_diff(const std::string& module_name,
     ocpp << "        v." << vname << "[wi] = w32;\n";
     ocpp << "        gv |= (T(w32) << (wi * 32));\n";
     ocpp << "      }\n";
-    ocpp << "      g.set_" << p.name << "(gv);\n";
+    ocpp << "      g.set_" << gname << "(gv);\n";
     ocpp << "    }\n";
     continue;
   }
@@ -280,16 +416,17 @@ bool CodeGenerator::generate_single_module_diff(const std::string& module_name,
     int w = p.get_width();
     if (w <= 0) continue;
     if (max_width_bits > 0 && w > max_width_bits) continue;
-    const std::string key = canon(p.name);
+    const std::string key = p.name;
     auto vit = vports.find(key);
     if (vit == vports.end()) continue;
     const std::string vname = vit->second.field_name;
+    const std::string gname = p.get_cpp_name();
 
     if (w <= 64) {
       ocpp << "    {\n";
       ocpp << "      const uint64_t m = mask_u64(" << w << ");\n";
       ocpp << "      const uint64_t vo = (uint64_t)(v." << vname << ") & m;\n";
-      ocpp << "      const uint64_t go = (uint64_t)(g.get_" << p.name << "()) & m;\n";
+      ocpp << "      const uint64_t go = (uint64_t)(g.get_" << gname << "()) & m;\n";
       ocpp << "      if (vo != go) {\n";
       ocpp << "        std::cerr << \"Mismatch at iter=\" << i << \" port=" << p.name << "\\n\";\n";
       ocpp << "        std::cerr << \"  verilator=\" << vo << \" gsim=\" << go << \"\\n\";\n";
@@ -305,7 +442,8 @@ bool CodeGenerator::generate_single_module_diff(const std::string& module_name,
     const int rem = w % 32;
     const int compare_words = (words < vwords) ? words : vwords;
     ocpp << "    {\n";
-    ocpp << "      auto gv = g.get_" << p.name << "();\n";
+    ocpp << "      using T = unsigned _BitInt(" << w << ");\n";
+    ocpp << "      const T gv = (T)g.get_" << gname << "();\n";
     // Be robust to width mismatches: never index past Verilator's VlWide length.
     // If widths disagree, report it and mark mismatch (but still compare the common prefix words).
     ocpp << "      if (" << vwords << " < " << words << ") {\n";
@@ -382,24 +520,84 @@ bool CodeGenerator::generate_single_module_diff(const std::string& module_name,
 std::string CodeGenerator::generate_assignment(const PortConnection& conn) {
   std::ostringstream oss;
 
-  // Check if this is a top-level input
+  const int w = conn.width;
+  const bool is_wide = (conn.width_type == PortWidthType::VL_W);
+  const int words = words_for_width(w);
+  const int rem = w % 32;
+
+  // TOP -> module inputs
   if (conn.is_top_level_input) {
-    // TOP -> COMB: read from public member variable
     for (const auto* receiver : conn.receiver_modules) {
-      std::string recv_ptr = "m_" + receiver->instance_name;
-      oss << "    " << recv_ptr << "->" << conn.port_name
-          << " = " << conn.port_name << ";\n";
+      const PortInfo* rp = find_port_by_logical_name(receiver, conn.port_name);
+      const std::string recv_ptr = "m_" + receiver->instance_name;
+      const std::string rcpp = rp ? rp->get_cpp_name() : conn.port_name;
+
+      if (!is_wide) {
+        if (receiver->is_gsim()) {
+          oss << "    " << recv_ptr << "->set_" << rcpp
+              << "(((uint64_t)" << conn.port_name << ") & _corvus_mask_u64(" << w << "));\n";
+        } else {
+          oss << "    " << recv_ptr << "->" << rcpp << " = " << conn.port_name << ";\n";
+        }
+      } else {
+        if (!receiver->is_gsim()) {
+          const int rwords = rp ? rp->array_size : words;
+          oss << "    for (int wi = 0; wi < " << rwords << "; ++wi) " << recv_ptr << "->" << rcpp
+              << "[wi] = " << conn.port_name << "[wi];\n";
+        } else {
+          oss << "    {\n";
+          oss << "      using T = unsigned _BitInt(" << w << ");\n";
+          oss << "      " << recv_ptr << "->set_" << rcpp << "(";
+          for (int wi = 0; wi < words; ++wi) {
+            if (wi != 0) oss << " | ";
+            oss << "(T(";
+            if (rem != 0 && wi == (words - 1)) {
+              oss << "((uint32_t)" << conn.port_name << "[" << wi << "] & _corvus_mask_u32(" << rem << "))";
+            } else {
+              oss << "(uint32_t)" << conn.port_name << "[" << wi << "]";
+            }
+            oss << ") << " << (wi * 32) << ")";
+          }
+          oss << ");\n";
+          oss << "    }\n";
+        }
+      }
     }
     return oss.str();
   }
 
-  // Check if this is a top-level output
+  // module outputs -> TOP
   if (conn.is_top_level_output) {
-    // COMB -> TOP: write to public member variable
-    if (conn.driver_module) {
-      std::string driver_ptr = "m_" + conn.driver_module->instance_name;
-      oss << "    " << conn.port_name << " = "
-          << driver_ptr << "->" << conn.port_name << ";\n";
+    if (!conn.driver_module) return oss.str();
+    const ModuleInfo* driver = conn.driver_module;
+    const PortInfo* dp = find_port_by_logical_name(driver, conn.port_name);
+    const std::string driver_ptr = "m_" + driver->instance_name;
+    const std::string dcpp = dp ? dp->get_cpp_name() : conn.port_name;
+
+    if (!is_wide) {
+      if (driver->is_gsim()) {
+        oss << "    " << conn.port_name << " = (uint64_t)(" << driver_ptr << "->get_" << dcpp
+            << "()) & _corvus_mask_u64(" << w << ");\n";
+      } else {
+        oss << "    " << conn.port_name << " = " << driver_ptr << "->" << dcpp << ";\n";
+      }
+    } else {
+      if (!driver->is_gsim()) {
+        const int dwords = dp ? dp->array_size : words;
+        oss << "    for (int wi = 0; wi < " << dwords << "; ++wi) " << conn.port_name
+            << "[wi] = " << driver_ptr << "->" << dcpp << "[wi];\n";
+      } else {
+        oss << "    {\n";
+        oss << "      using T = unsigned _BitInt(" << w << ");\n";
+        oss << "      for (int wi = 0; wi < " << words << "; ++wi) {\n";
+        oss << "        uint32_t w32 = (uint32_t)(((T)" << driver_ptr << "->get_" << dcpp << "() >> (wi * 32)) & 0xffffffffu);\n";
+        if (rem != 0) {
+          oss << "        if (wi == " << (words - 1) << ") w32 &= _corvus_mask_u32(" << rem << ");\n";
+        }
+        oss << "        " << conn.port_name << "[wi] = w32;\n";
+        oss << "      }\n";
+        oss << "    }\n";
+      }
     }
     return oss.str();
   }
@@ -409,26 +607,79 @@ std::string CodeGenerator::generate_assignment(const PortConnection& conn) {
     return "    // ERROR: Invalid connection\n";
   }
 
-  std::string driver_ptr = "m_" + conn.driver_module->instance_name;
+  const ModuleInfo* driver = conn.driver_module;
+  const PortInfo* dp = find_port_by_logical_name(driver, conn.port_name);
+  const std::string driver_ptr = "m_" + driver->instance_name;
+  const std::string dcpp = dp ? dp->get_cpp_name() : conn.port_name;
 
-  // Get driver port info to check type
-  const PortInfo* driver_port = nullptr;
-  for (const auto& p : conn.driver_module->ports) {
-    if (p.name == conn.port_name) {
-      driver_port = &p;
-      break;
-    }
-  }
-
-  if (!driver_port) {
-    return "    // ERROR: Port not found in driver module\n";
-  }
-
-  // Generate assignments to all receivers
   for (const auto* receiver : conn.receiver_modules) {
-    std::string recv_ptr = "m_" + receiver->instance_name;
-      oss << "    " << recv_ptr << "->" << conn.port_name
-          << " = " << driver_ptr << "->" << conn.port_name << ";\n";
+    const PortInfo* rp = find_port_by_logical_name(receiver, conn.port_name);
+    const std::string recv_ptr = "m_" + receiver->instance_name;
+    const std::string rcpp = rp ? rp->get_cpp_name() : conn.port_name;
+
+    if (!is_wide) {
+      const std::string read_expr =
+        driver->is_gsim()
+          ? ("(((uint64_t)" + driver_ptr + "->get_" + dcpp + "()) & _corvus_mask_u64(" + std::to_string(w) + "))")
+          : ("(((uint64_t)" + driver_ptr + "->" + dcpp + ") & _corvus_mask_u64(" + std::to_string(w) + "))");
+
+      if (receiver->is_gsim()) {
+        oss << "    " << recv_ptr << "->set_" << rcpp << "(" << read_expr << ");\n";
+      } else {
+        oss << "    " << recv_ptr << "->" << rcpp << " = " << read_expr << ";\n";
+    }
+      continue;
+    }
+
+    // Wide (>= 65b): connect via 32-bit words / _BitInt.
+    if (!driver->is_gsim() && !receiver->is_gsim()) {
+      const int dwords = dp ? dp->array_size : words;
+      const int rwords = rp ? rp->array_size : words;
+      const int n = (dwords < rwords) ? dwords : rwords;
+      oss << "    for (int wi = 0; wi < " << n << "; ++wi) " << recv_ptr << "->" << rcpp
+          << "[wi] = " << driver_ptr << "->" << dcpp << "[wi];\n";
+      continue;
+    }
+
+    if (!driver->is_gsim() && receiver->is_gsim()) {
+      const int dwords = dp ? dp->array_size : words;
+      const int drive_words = (dwords < words) ? dwords : words;
+      oss << "    {\n";
+      oss << "      using T = unsigned _BitInt(" << w << ");\n";
+      oss << "      " << recv_ptr << "->set_" << rcpp << "(";
+      for (int wi = 0; wi < drive_words; ++wi) {
+        if (wi != 0) oss << " | ";
+        oss << "(T(";
+        if (rem != 0 && wi == (words - 1)) {
+          oss << "((uint32_t)" << driver_ptr << "->" << dcpp << "[" << wi << "] & _corvus_mask_u32(" << rem << "))";
+        } else {
+          oss << "(uint32_t)" << driver_ptr << "->" << dcpp << "[" << wi << "]";
+        }
+        oss << ") << " << (wi * 32) << ")";
+      }
+      oss << ");\n";
+      oss << "    }\n";
+      continue;
+    }
+
+    if (driver->is_gsim() && !receiver->is_gsim()) {
+      const int rwords = rp ? rp->array_size : words;
+      oss << "    {\n";
+      oss << "      using T = unsigned _BitInt(" << w << ");\n";
+      oss << "      for (int wi = 0; wi < " << rwords << "; ++wi) " << recv_ptr << "->" << rcpp << "[wi] = 0;\n";
+      oss << "      for (int wi = 0; wi < " << words << " && wi < " << rwords << "; ++wi) {\n";
+      oss << "        uint32_t w32 = (uint32_t)(((T)" << driver_ptr << "->get_" << dcpp << "() >> (wi * 32)) & 0xffffffffu);\n";
+      if (rem != 0) {
+        oss << "        if (wi == " << (words - 1) << ") w32 &= _corvus_mask_u32(" << rem << ");\n";
+      }
+      oss << "        " << recv_ptr << "->" << rcpp << "[wi] = w32;\n";
+      oss << "      }\n";
+      oss << "    }\n";
+      continue;
+    }
+
+    // driver GSIM -> receiver GSIM
+    oss << "    " << recv_ptr << "->set_" << rcpp << "(" << driver_ptr << "->get_" << dcpp << "());\n";
   }
 
   return oss.str();
@@ -641,15 +892,15 @@ bool CodeGenerator::generate_all(const std::string& output_file_base) {
   out_h << "#ifndef " << header_guard << "\n";
   out_h << "#define " << header_guard << "\n";
   out_h << "\n";
-  out_h << "// Verilator includes\n";
+  out_h << "// Common includes\n";
   out_h << "#include \"verilated.h\"\n";
+  out_h << "#include <cstdint>\n";
   out_h << "\n";
-  out_h << "// Auto-generated: Include all Verilator-generated module headers\n";
+  out_h << "// Auto-generated: Include module headers from selected backends (Verilator/GSIM)\n";
 
-  // Generate include statements from modules_ keys
   for (const auto& pair : modules_) {
-    const std::string& module_name = pair.first;
-    out_h << "#include \"V" << module_name << ".h\"\n";
+    const ModuleInfo& m = pair.second;
+    out_h << "#include \"" << path_basename(m.header_path) << "\"\n";
   }
   out_h << "\n";
   out_h << "// ============================================================================\n";
@@ -673,6 +924,23 @@ bool CodeGenerator::generate_all(const std::string& output_file_base) {
   out_cpp << "// ============================================================================\n";
   out_cpp << "\n";
   out_cpp << "#include \"" << output_h_file << "\"\n";
+  out_cpp << "#include <cstdint>\n";
+  out_cpp << "\n";
+  out_cpp << "#ifndef CORVUS_GSIM_COMB_STEPS\n";
+  out_cpp << "#define CORVUS_GSIM_COMB_STEPS 1\n";
+  out_cpp << "#endif\n";
+  out_cpp << "\n";
+  // (debug instrumentation removed)\n";
+  out_cpp << "static inline uint64_t _corvus_mask_u64(int w) {\n";
+  out_cpp << "  if (w <= 0) return 0;\n";
+  out_cpp << "  if (w >= 64) return ~0ull;\n";
+  out_cpp << "  return (1ull << w) - 1ull;\n";
+  out_cpp << "}\n";
+  out_cpp << "static inline uint32_t _corvus_mask_u32(int w) {\n";
+  out_cpp << "  if (w <= 0) return 0;\n";
+  out_cpp << "  if (w >= 32) return 0xffffffffu;\n";
+  out_cpp << "  return (1u << w) - 1u;\n";
+  out_cpp << "}\n";
   out_cpp << "\n";
   out_cpp << "// ============================================================================\n";
   out_cpp << "// Constructor & Destructor\n";
@@ -681,9 +949,8 @@ bool CodeGenerator::generate_all(const std::string& output_file_base) {
 
   // Generate constructor initialization from modules_
   for (const auto& pair : modules_) {
-    const std::string& module_name = pair.first;
-    const std::string& instance_name = pair.second.instance_name;
-    out_cpp << "    m_" << instance_name << " = new V" << module_name << "();\n";
+    const ModuleInfo& m = pair.second;
+    out_cpp << "    m_" << m.instance_name << " = new " << m.class_name << "();\n";
   }
 
   out_cpp << "}\n";
@@ -723,7 +990,11 @@ bool CodeGenerator::generate_all(const std::string& output_file_base) {
   }
 
   out_cpp << "void VCorvusTopWrapper::eval() {\n";
-  out_cpp << "    // Propagate inputs, SEQ and EXTERNAL to COMB\n";
+  out_cpp << "    // Mixed-backend scheduling note:\n";
+  out_cpp << "    // We do a two-phase settle so that after SEQ updates (posedge),\n";
+  out_cpp << "    // COMB is re-evaluated and top-level outputs reflect the updated state.\n";
+  out_cpp << "    //\n";
+  out_cpp << "    // Phase 0: drive COMB inputs from TOP/SEQ/EXTERNAL\n";
   out_cpp << "    propagate_inputs_to_comb();\n";
   out_cpp << "    propagate_seq_to_comb();\n";
   out_cpp << "    propagate_external_to_comb();\n";
@@ -731,36 +1002,59 @@ bool CodeGenerator::generate_all(const std::string& output_file_base) {
 
   // Evaluate COMB modules
   if (!comb_modules.empty()) {
-    out_cpp << "    // Evaluate COMB modules (" << comb_modules.size() << " modules)\n";
+    out_cpp << "    // Phase 1: evaluate COMB modules (" << comb_modules.size() << " modules)\n";
     for (const auto* module : comb_modules) {
+      if (module->is_gsim()) {
+        out_cpp << "    for (int __i = 0; __i < CORVUS_GSIM_COMB_STEPS; ++__i) m_" << module->instance_name << "->step();\n";
+      } else {
       out_cpp << "    m_" << module->instance_name << "->eval();\n";
+      }
     }
     out_cpp << "\n";
   }
 
-  out_cpp << "    // Propagate COMB to SEQ, EXTERNAL and outputs\n";
+  out_cpp << "    // Phase 1.5: snapshot top outputs from COMB (pre-SEQ)\n";
+  out_cpp << "    propagate_comb_to_outputs();\n";
+  out_cpp << "\n";
+  out_cpp << "    // Phase 2: propagate COMB outputs into SEQ/EXTERNAL\n";
   out_cpp << "    propagate_comb_to_seq();\n";
   out_cpp << "    propagate_comb_to_external();\n";
-  out_cpp << "    propagate_comb_to_outputs();\n";
   out_cpp << "\n";
 
   // Evaluate SEQ modules
   if (!seq_modules.empty()) {
-    out_cpp << "    // Evaluate SEQ modules (" << seq_modules.size() << " modules)\n";
+    out_cpp << "    // Phase 3: evaluate SEQ modules (" << seq_modules.size() << " modules)\n";
     for (const auto* module : seq_modules) {
-      out_cpp << "    m_" << module->instance_name << "->eval();\n";
+      out_cpp << "    m_" << module->instance_name << "->" << (module->is_gsim() ? "step" : "eval") << "();\n";
     }
     out_cpp << "\n";
   }
 
   // Evaluate EXTERNAL modules
   if (!external_modules.empty()) {
-    out_cpp << "    // Evaluate EXTERNAL modules (" << external_modules.size() << " modules)\n";
+    out_cpp << "    // Phase 3: evaluate EXTERNAL modules (" << external_modules.size() << " modules)\n";
     for (const auto* module : external_modules) {
-      out_cpp << "    m_" << module->instance_name << "->eval();\n";
+      out_cpp << "    m_" << module->instance_name << "->" << (module->is_gsim() ? "step" : "eval") << "();\n";
     }
     out_cpp << "\n";
   }
+
+  out_cpp << "    // Phase 4: re-drive COMB from updated SEQ/EXTERNAL and re-evaluate COMB\n";
+  out_cpp << "    propagate_seq_to_comb();\n";
+  out_cpp << "    propagate_external_to_comb();\n";
+  if (!comb_modules.empty()) {
+    out_cpp << "    // Phase 4: evaluate COMB modules (post-SEQ)\n";
+    for (const auto* module : comb_modules) {
+      if (module->is_gsim()) {
+        out_cpp << "    for (int __i = 0; __i < CORVUS_GSIM_COMB_STEPS; ++__i) m_" << module->instance_name << "->step();\n";
+      } else {
+      out_cpp << "    m_" << module->instance_name << "->eval();\n";
+      }
+    }
+    out_cpp << "\n";
+  }
+  out_cpp << "    // Phase 5: final top-level outputs from COMB (post-SEQ)\n";
+  out_cpp << "    propagate_comb_to_outputs();\n";
 
   out_cpp << "}\n";
   out_cpp << "\n";
@@ -820,9 +1114,8 @@ bool CodeGenerator::generate_all(const std::string& output_file_base) {
 
   // Generate member variable declarations from modules_
   for (const auto& pair : modules_) {
-    const std::string& module_name = pair.first;
-    const std::string& instance_name = pair.second.instance_name;
-    out_h << "    V" << module_name << "* m_" << instance_name << ";\n";
+    const ModuleInfo& m = pair.second;
+    out_h << "    " << m.class_name << "* m_" << m.instance_name << ";\n";
   }
 
   out_h << "\n";
@@ -835,6 +1128,22 @@ bool CodeGenerator::generate_all(const std::string& output_file_base) {
   out_h << "    void propagate_comb_to_external();\n";
   out_h << "    void propagate_external_to_comb();\n";
   out_h << "    void propagate_comb_to_outputs();\n";
+
+  // Chunk helpers for large propagations (declared only when needed).
+  constexpr size_t kChunkSize = 512;
+  const size_t comb_to_seq_chunks = (comb_to_seq.size() + kChunkSize - 1) / kChunkSize;
+  const size_t seq_to_comb_chunks = (seq_to_comb.size() + kChunkSize - 1) / kChunkSize;
+  if (comb_to_seq.size() > kChunkSize) {
+    for (size_t i = 0; i < comb_to_seq_chunks; ++i) {
+      out_h << "    void propagate_comb_to_seq_chunk" << i << "();\n";
+    }
+  }
+  if (seq_to_comb.size() > kChunkSize) {
+    for (size_t i = 0; i < seq_to_comb_chunks; ++i) {
+      out_h << "    void propagate_seq_to_comb_chunk" << i << "();\n";
+    }
+  }
+
   out_h << "};\n";
   out_h << "\n";
   out_h << "#endif // " << header_guard << "\n";
@@ -846,13 +1155,13 @@ bool CodeGenerator::generate_all(const std::string& output_file_base) {
   out_cpp << "\n";
 
   std::cout << "  Generating propagate_comb_to_seq()... (" << comb_to_seq.size() << " connections)" << std::endl;
-  out_cpp << generate_propagate_function(comb_to_seq, "propagate_comb_to_seq",
-                     "COMB -> SEQ: " + std::to_string(comb_to_seq.size()) + " connections");
+  out_cpp << generate_chunked_propagate(comb_to_seq, "propagate_comb_to_seq",
+                     "COMB -> SEQ: " + std::to_string(comb_to_seq.size()) + " connections", kChunkSize);
   out_cpp << "\n";
 
   std::cout << "  Generating propagate_seq_to_comb()... (" << seq_to_comb.size() << " connections)" << std::endl;
-  out_cpp << generate_propagate_function(seq_to_comb, "propagate_seq_to_comb",
-                     "SEQ -> COMB: " + std::to_string(seq_to_comb.size()) + " connections");
+  out_cpp << generate_chunked_propagate(seq_to_comb, "propagate_seq_to_comb",
+                     "SEQ -> COMB: " + std::to_string(seq_to_comb.size()) + " connections", kChunkSize);
   out_cpp << "\n";
 
   std::cout << "  Generating propagate_comb_to_external()... (" << comb_to_ext.size() << " connections)" << std::endl;
@@ -941,6 +1250,20 @@ bool CodeGenerator::generate_makefile(const std::string& output_file_base) {
     return false;
   }
 
+  const std::string module_path = to_abs_path(modules_dir_);
+  bool has_gsim = false;
+  bool gsim_needs_src_any = false;
+  for (const auto& kv : modules_) {
+    if (kv.second.is_gsim()) {
+      has_gsim = true;
+      // If any GSIM module lacks a prebuilt lib, we will compile its generated sources.
+      const ModuleInfo& m = kv.second;
+      const std::string dir_abs = module_path + "/gsim-compile-" + m.module_name;
+      const std::string gsim_lib_abs = dir_abs + "/lib" + m.class_name + ".a";
+      if (!file_exists(gsim_lib_abs)) gsim_needs_src_any = true;
+    }
+  }
+
   out << "# Auto-generated Makefile for VCorvusTopWrapper\n";
   out << "# Generated: " << __DATE__ << " " << __TIME__ << "\n";
   out << "\n";
@@ -949,21 +1272,32 @@ bool CodeGenerator::generate_makefile(const std::string& output_file_base) {
   out << "_CORVUS_VERILATOR_INCLUDE = $(_CORVUS_VERILATOR_ROOT)/include\n";
   out << "\n";
   out << "# Module directories\n";
-  out << "_CORVUS_MODULE_PATH = " << modules_dir_ << "\n";
+  out << "_CORVUS_MODULE_PATH = " << module_path << "\n";
 
-  // Generate module directory variables
+  // Generate module directory variables (mixed backends)
   for (const auto& pair : modules_) {
-    const std::string& module_name = pair.first;
-    std::string var_name = module_name;
+    const ModuleInfo& m = pair.second;
+    std::string var_name = m.module_name;
     std::transform(var_name.begin(), var_name.end(), var_name.begin(), ::toupper);
-    std::replace(var_name.begin(), var_name.end(), '_', '_');
-    out << "_CORVUS_" << var_name << "_DIR = $(_CORVUS_MODULE_PATH)/verilator-compile-" << module_name << "\n";
+    out << "_CORVUS_" << var_name << "_DIR = $(_CORVUS_MODULE_PATH)/"
+        << (m.is_gsim() ? "gsim-compile-" : "verilator-compile-") << m.module_name << "\n";
   }
 
   out << "\n";
   out << "# Compiler settings\n";
+  if (has_gsim) {
+    // GSIM-generated headers may require clang with BITINT support.
+    out << "_CORVUS_CXX ?= clang++-19\n";
+    if (gsim_needs_src_any) {
+      // Compiling GSIM-generated sources can be very heavy; prefer low optimization for reliability.
+      out << "_CORVUS_CXXFLAGS = -std=c++20 -O0 -g0 -w \\\n";
+    } else {
+      out << "_CORVUS_CXXFLAGS = -std=c++20 -O2 -Wall -Wextra -g \\\n";
+    }
+  } else {
   out << "_CORVUS_CXX ?= g++\n";
-  out << "_CORVUS_CXXFLAGS = -std=c++14 -Wall -Wextra -g \\\n";
+    out << "_CORVUS_CXXFLAGS = -std=c++14 -O2 -Wall -Wextra -g \\\n";
+  }
   out << "                   -I. \\\n";
   out << "                   -I$(_CORVUS_VERILATOR_INCLUDE) \\\n";
   out << "                   -I$(_CORVUS_VERILATOR_INCLUDE)/vltstd";
@@ -1014,12 +1348,44 @@ bool CodeGenerator::generate_makefile(const std::string& output_file_base) {
   out << "# Generated module object files\n";
   out << "_CORVUS_MODULE_OBJS =";
 
+  // Some GSIM outputs in the repo are "header + cpp + module.json" without a prebuilt lib.
+  // For those, we compile the per-module *.cpp into the final binary.
+  out << "\n\n";
+  out << "# GSIM source files (used when libS*.a is not present)\n";
+  out << "_CORVUS_GSIM_SRCS =";
+
   for (const auto& pair : modules_) {
-    const std::string& module_name = pair.first;
-    std::string var_name = module_name;
+    const ModuleInfo& m = pair.second;
+    std::string var_name = m.module_name;
     std::transform(var_name.begin(), var_name.end(), var_name.begin(), ::toupper);
-    out << " \\\n                      $(" << "_CORVUS_" << var_name << "_DIR)/V" << module_name << "__ALL.a";
+
+    const std::string dir_abs = module_path + "/" + (m.is_gsim() ? "gsim-compile-" : "verilator-compile-") + m.module_name;
+    std::string lib_expr;
+    if (m.is_verilator()) {
+      const std::string all_abs = dir_abs + "/" + m.class_name + "__ALL.a";
+      const bool has_all = file_exists(all_abs);
+      lib_expr = has_all
+        ? ("$(_CORVUS_" + var_name + "_DIR)/" + m.class_name + "__ALL.a")
+        : ("$(_CORVUS_" + var_name + "_DIR)/lib" + m.class_name + ".a");
+    } else {
+      // GSIM: prefer lib<class_name>.a when present; otherwise compile *.cpp directly.
+      const std::string gsim_lib_abs = dir_abs + "/lib" + m.class_name + ".a";
+      const bool has_gsim_lib = file_exists(gsim_lib_abs);
+      if (has_gsim_lib) {
+        lib_expr = "$(_CORVUS_" + var_name + "_DIR)/lib" + m.class_name + ".a";
+      } else {
+        // No lib: compile all module-local generated sources.
+        out << " \\\n                      $(wildcard $(_CORVUS_" << var_name << "_DIR)/*.cpp)";
+        lib_expr.clear();
+      }
+    }
+
+    if (!lib_expr.empty()) {
+      out << " \\\n                      " << lib_expr;
   }
+  }
+
+  out << "\n";
 
   out << "\n\n";
   out << "# Build targets\n";
@@ -1027,7 +1393,8 @@ bool CodeGenerator::generate_makefile(const std::string& output_file_base) {
   out << "#   make _CORVUS_TARGET=my_program _CORVUS_MAIN_SRC=my_main.cpp\n";
   out << "_CORVUS_TARGET ?= main\n";
   out << "_CORVUS_MAIN_SRC ?= main.cpp\n";
-  out << "_CORVUS_SOURCES = $(_CORVUS_MAIN_SRC) " << wrapper_cpp_file << " $(_CORVUS_VERILATOR_LIBS) $(_CORVUS_USER_SRC_FILES)\n";
+  out << "_CORVUS_SOURCES = $(_CORVUS_MAIN_SRC) " << wrapper_cpp_file
+      << " $(_CORVUS_VERILATOR_LIBS) $(_CORVUS_GSIM_SRCS) $(_CORVUS_USER_SRC_FILES)\n";
   out << "\n";
   out << ".PHONY: _CORVUS_all _CORVUS_clean _CORVUS_test\n";
   out << "\n";

@@ -21,6 +21,12 @@
  */
 class CodeGenerator {
 public:
+  enum class BackendPolicy {
+    MIXED,         // COMB prefers GSIM; SEQ/EXTERNAL prefer Verilator (default)
+    VERILATOR_ONLY,
+    GSIM_ONLY
+  };
+
   /**
    * Constructor with automatic simulator detection
    * @param modules_dir Directory containing simulator output
@@ -34,6 +40,13 @@ public:
    */
   CodeGenerator(const std::string& modules_dir, 
                 SimulatorFactory::SimulatorType simulator_type);
+
+  /**
+   * Set backend selection policy when multiple simulator outputs exist for the same module.
+   */
+  void set_backend_policy(BackendPolicy p) { backend_policy_ = p; }
+
+  BackendPolicy backend_policy() const { return backend_policy_; }
 
   /**
    * Load module and connection data
@@ -107,6 +120,8 @@ private:
   std::map<std::string, ModuleInfo> modules_;  // Module information
   ConnectionBuilder* conn_builder_;  // Connection builder
 
+  BackendPolicy backend_policy_ = BackendPolicy::MIXED;
+
   // Connection statistics
   int total_connections_;
   int vlwide_ports_;
@@ -118,6 +133,15 @@ private:
    * @return C++ assignment statement
    */
   std::string generate_assignment(const PortConnection& conn);
+
+  /**
+   * Generate a large propagate function as many smaller chunks to avoid very
+   * large single functions (better compile reliability and speed).
+   */
+  std::string generate_chunked_propagate(const std::vector<PortConnection>& connections,
+                                         const std::string& function_name,
+                                         const std::string& comment,
+                                         size_t chunk_size);
 
   /**
    * Check if type is VlWide

@@ -11,6 +11,17 @@ static bool file_exists(const std::string& path) {
   return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
+// Normalize port names across simulators so ConnectionBuilder can match them.
+// Verilator sometimes encodes '/' as "2F" in C++ member identifiers; GSIM typically uses '_'.
+// We keep the original identifier in PortInfo.cpp_name and use the normalized name for PortInfo.name.
+static std::string normalize_port_logical_name(std::string n) {
+  for (size_t pos = 0; (pos = n.find("2F", pos)) != std::string::npos;) {
+    n.replace(pos, 2, "_");
+    pos += 1;
+  }
+  return n;
+}
+
 // ============================================================================
 // ModuleParser Base Class - Common utility functions
 // ============================================================================
@@ -101,6 +112,7 @@ VerilatorModuleParser::VerilatorModuleParser() {
 ModuleInfo VerilatorModuleParser::parse(const std::string& header_path) {
   ModuleInfo info;
   info.header_path = header_path;
+  info.simulator_name = get_simulator_name();
 
   // Extract module name from file name
   // "/path/to/Vcorvus_comb_P0.h" -> "Vcorvus_comb_P0"
@@ -176,6 +188,8 @@ PortInfo VerilatorModuleParser::parse_port_macro(const std::string& line) {
     port.name = match[2];
     port.name.erase(0, port.name.find_first_not_of(" \t"));
     port.name.erase(port.name.find_last_not_of(" \t") + 1);
+    port.cpp_name = port.name;
+    port.name = normalize_port_logical_name(port.name);
 
     // msb, lsb, words
     port.msb = std::stoi(match[3]);
@@ -203,6 +217,8 @@ PortInfo VerilatorModuleParser::parse_port_macro(const std::string& line) {
     port.name = match[3];
     port.name.erase(0, port.name.find_first_not_of(" \t"));
     port.name.erase(port.name.find_last_not_of(" \t") + 1);
+    port.cpp_name = port.name;
+    port.name = normalize_port_logical_name(port.name);
 
     // msb, lsb
     port.msb = std::stoi(match[4]);
@@ -273,6 +289,7 @@ ModuleType GsimModuleParser::parse_module_type_str(const std::string& s) {
 ModuleInfo GsimModuleParser::parse(const std::string& header_path) {
   ModuleInfo info;
   info.header_path = header_path;
+  info.simulator_name = get_simulator_name();
 
   // Locate module directory and module.json
   size_t last_slash = header_path.find_last_of('/');
@@ -339,6 +356,8 @@ ModuleInfo GsimModuleParser::parse(const std::string& header_path) {
     std::smatch m = *it;
     PortInfo p;
     p.name = m[1].str();
+    p.cpp_name = p.name;
+    p.name = normalize_port_logical_name(p.name);
     std::string dir_str = m[2].str();
     int width = std::stoi(m[3].str());
     if (width <= 0) width = 1;  // be defensive: treat unknown/0-width as 1-bit

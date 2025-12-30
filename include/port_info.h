@@ -17,7 +17,13 @@ enum class PortWidthType {
 };
 
 struct PortInfo {
+  // Logical port name used for cross-module matching and top-level wrapper interface.
+  // This may be normalized (e.g. "2F" -> "_" for Verilator-encoded hierarchical names).
   std::string name;
+  // C++ identifier used to access the port in the generated simulator C++ API.
+  // For Verilator this is typically the original member name (may contain "2F").
+  // For GSIM this is typically the method suffix / member name from module.json.
+  std::string cpp_name;
   PortDirection direction;
   PortWidthType width_type;
   int msb;
@@ -27,6 +33,12 @@ struct PortInfo {
   // Get actual bit width
   int get_width() const {
     return msb - lsb + 1;
+  }
+
+  // Get the C++ identifier to use in generated code.
+  // Falls back to logical name when cpp_name is not populated (backward-compatible).
+  std::string get_cpp_name() const {
+    return cpp_name.empty() ? name : cpp_name;
   }
 
   // Get corresponding C++ type

@@ -18,6 +18,10 @@ struct ModuleInfo {
   ModuleType type;
   int partition_id;           // P0 -> 0, P1 -> 1, external -> -1
 
+  // Which simulator backend produced this module (e.g. "Verilator", "GSIM").
+  // Used by CodeGenerator to choose eval/step and port access style.
+  std::string simulator_name;
+
   std::string header_path;
   std::string lib_path;
 
@@ -54,6 +58,9 @@ struct ModuleInfo {
       default: return "UNKNOWN";
     }
   }
+
+  bool is_gsim() const { return simulator_name == "GSIM"; }
+  bool is_verilator() const { return simulator_name == "Verilator"; }
 };
 
 #endif // MODULE_INFO_H
